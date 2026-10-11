@@ -182,7 +182,9 @@ namespace LlamaApp
                     ? "Could not read GPU memory from the installed runtime."
                     : devices.Length == 0
                         ? "No GPUs were reported by the installed runtime."
-                        : "Free memory is a snapshot from the installed runtime and can change. Restart after switching runtimes to refresh this list.";
+                        : "Free memory is a snapshot from the installed runtime and can change. Restart after switching runtimes to refresh this list." +
+                          string.Concat(devices.Where(d => d.CompatibilityError is not null)
+                              .Select(d => "\n" + d.CompatibilityError));
                 foreach (var device in devices)
                 {
                     var key = Llama.GpuDeviceChoice.Key(device, devices);
@@ -194,12 +196,20 @@ namespace LlamaApp
                     {
                         existing.Content = Llama.GpuDeviceChoice.Label(device);
                         existing.Tag = key;
+                        existing.IsEnabled = device.CompatibilityError is null;
+                        ToolTipService.SetToolTip(existing, device.CompatibilityError);
                     }
-                    else GpuDeviceBox.Items.Add(new ComboBoxItem
+                    else
                     {
-                        Content = Llama.GpuDeviceChoice.Label(device),
-                        Tag = key,
-                    });
+                        var item = new ComboBoxItem
+                        {
+                            Content = Llama.GpuDeviceChoice.Label(device),
+                            Tag = key,
+                            IsEnabled = device.CompatibilityError is null,
+                        };
+                        ToolTipService.SetToolTip(item, device.CompatibilityError);
+                        GpuDeviceBox.Items.Add(item);
+                    }
                 }
             }
             catch (Exception ex)

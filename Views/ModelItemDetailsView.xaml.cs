@@ -93,7 +93,9 @@ public sealed partial class ModelItemDetailsView : UserControl
                 ? "Could not read GPU memory from the installed runtime."
                 : devices.Length == 0
                     ? "No GPUs were reported by the installed runtime."
-                    : "Free memory is a snapshot from the installed runtime and can change.";
+                    : "Free memory is a snapshot from the installed runtime and can change." +
+                      string.Concat(devices.Where(d => d.CompatibilityError is not null)
+                          .Select(d => "\n" + d.CompatibilityError));
             var saved = viewModel.PromptProfile.GpuDeviceName;
             foreach (var device in devices)
             {
@@ -105,9 +107,19 @@ public sealed partial class ModelItemDetailsView : UserControl
                 {
                     existing.Content = GpuDeviceChoice.Label(device);
                     existing.Tag = key;
+                    existing.IsEnabled = device.CompatibilityError is null;
+                    Microsoft.UI.Xaml.Controls.ToolTipService.SetToolTip(existing, device.CompatibilityError);
                 }
-                else ModelGpuDeviceBox.Items.Add(new Microsoft.UI.Xaml.Controls.ComboBoxItem
-                    { Content = GpuDeviceChoice.Label(device), Tag = key });
+                else
+                {
+                    var item = new Microsoft.UI.Xaml.Controls.ComboBoxItem
+                    {
+                        Content = GpuDeviceChoice.Label(device), Tag = key,
+                        IsEnabled = device.CompatibilityError is null,
+                    };
+                    Microsoft.UI.Xaml.Controls.ToolTipService.SetToolTip(item, device.CompatibilityError);
+                    ModelGpuDeviceBox.Items.Add(item);
+                }
             }
             var savedItem = ModelGpuDeviceBox.Items.OfType<Microsoft.UI.Xaml.Controls.ComboBoxItem>()
                 .FirstOrDefault(item => item.Tag as string == saved);
@@ -164,6 +176,12 @@ public sealed partial class ModelItemDetailsView : UserControl
     private void SavePromptProfile_Click(object sender, RoutedEventArgs e)
     {
         if (ViewModel is not { } vm) return;
+        if (ModelGpuDeviceBox.SelectedItem is Microsoft.UI.Xaml.Controls.ComboBoxItem { IsEnabled: false } item &&
+            Microsoft.UI.Xaml.Controls.ToolTipService.GetToolTip(item) is string compatibilityError)
+        {
+            PromptProfileStatus.Text = compatibilityError;
+            return;
+        }
         var batch = double.IsNaN(ModelBatchSizeBox.Value) ? 0
             : (int)Math.Clamp(ModelBatchSizeBox.Value, 0, InferenceTuning.MaxBatchSize);
         var microbatch = double.IsNaN(ModelMicroBatchSizeBox.Value) ? 0

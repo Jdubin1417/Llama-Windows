@@ -46,6 +46,12 @@ public sealed record LlamaDevice
 
     /// <summary>Backend class derived from the <see cref="Id"/> prefix.</summary>
     public DeviceKind Kind { get; init; }
+
+    /// <summary>HIP architecture reported by the SDK, when available.</summary>
+    public string? Architecture { get; init; }
+
+    /// <summary>Why this detected GPU cannot use the installed runtime.</summary>
+    public string? CompatibilityError { get; init; }
 }
 
 /// <summary>
@@ -121,7 +127,7 @@ public static partial class DeviceQuery
             }
 
             if (output is not null && output.Contains(Header, StringComparison.Ordinal))
-                return new DeviceProbe(true, Parse(output));
+                return new DeviceProbe(true, await RocmCompatibility.InspectAsync(binaryPath, Parse(output), cancel));
         }
 
         return new DeviceProbe(false, []);
@@ -144,7 +150,7 @@ public static partial class DeviceQuery
     /// build, and the device section must survive both). Bounded by a 10s
     /// timeout; a hung probe is killed and reported as <c>null</c>.
     /// </summary>
-    private static async Task<string?> RunAsync(string binaryPath, string[] args, CancellationToken cancel)
+    internal static async Task<string?> RunAsync(string binaryPath, string[] args, CancellationToken cancel)
     {
         var psi = new ProcessStartInfo
         {
@@ -172,9 +178,12 @@ public static partial class DeviceQuery
         {
             await proc.WaitForExitAsync(timeout.Token);
         }
-        catch (OperationCanceledException) when (!cancel.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
-            try { proc.Kill(entireProcessTree: true); } catch { /* best-effort */ }
+            try { proc.Kill(entireProcessTree: true); }
+            catch (InvalidOperationException) { }
+            catch (System.ComponentModel.Win32Exception ex) { Log.Warn(ex, "device probe cleanup failed"); }
+            cancel.ThrowIfCancellationRequested();
             return null;
         }
 

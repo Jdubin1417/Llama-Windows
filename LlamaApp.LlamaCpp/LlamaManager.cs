@@ -314,6 +314,8 @@ public sealed class LlamaManager
     public ModelPromptProcessingProfile AdvancedInferenceProfile { get; set; } = new();
 
     private DeviceProbe _lastDeviceProbe = new(false, []);
+    private RocmDeviceIsolation? _rocmIsolation;
+    private string? _adoptedRuntimeError;
     private ServeCapabilities _serveCapabilities = new(false, false, false, false);
 
     private ModelPromptProcessingProfile BuildGlobalInferenceProfile() =>
@@ -572,10 +574,8 @@ public sealed class LlamaManager
             if (await WaitForReachableAsync(TimeSpan.FromSeconds(3), cancel))
             {
                 Log.Info("adopted an already-running llama server");
+                await InitializeAdoptedRuntimeAsync(cancel);
                 ServerStatus = ServerState.Running;
-                // Best-effort: resolve the binary so Version is populated for display,
-                // but don't block the client on it.
-                _ = ResolveAndReadVersionAsync(cancel);
                 return true;
             }
 
@@ -693,6 +693,64 @@ public sealed class LlamaManager
             }
         }
         catch (Exception ex) { Log.Warn(ex, "best-effort version resolve failed"); }
+    }
+
+    private static string RocmStatePath => Path.Combine(AppData.Root, ".llama.rocm.json");
+
+    private async Task InitializeAdoptedRuntimeAsync(CancellationToken cancel)
+    {
+        await ResolveAndReadVersionAsync(cancel);
+        _lastDeviceProbe = await ProbeDevicesAsync(cancel, force: true);
+        _rocmIsolation = null;
+        _adoptedRuntimeError = null;
+        ActiveDeviceId = null;
+        if (!_lastDeviceProbe.Devices.Any(d => d.Kind == DeviceKind.Rocm) && !(!_lastDeviceProbe.Succeeded &&
+                InferenceRuntime.Normalize(RuntimeBackend) == InferenceRuntime.Rocm)) return;
+        try
+        {
+            var desired = RocmDeviceIsolation.Create(_lastDeviceProbe, RocmDeviceIsolation.InheritedVisibility);
+            if (ReadLiveManagedPid(PidFilePath) is { } pid && File.Exists(RocmStatePath))
+            {
+                var saved = JsonSerializer.Deserialize<RocmServerState>(File.ReadAllText(RocmStatePath));
+                using var process = Process.GetProcessById(pid);
+                if (desired is not null && saved is not null && saved.Matches(pid, process.StartTime.ToUniversalTime().Ticks,
+                        BinaryPath, File.GetLastWriteTimeUtc(BinaryPath!).Ticks, desired, _lastDeviceProbe,
+                        RuntimeBackend, GpuDeviceName))
+                {
+                    _rocmIsolation = saved.Isolation;
+                    ActiveDeviceId = saved.ActiveDeviceId;
+                    UpdateModelProfileWarning();
+                    return;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or
+                                   InvalidOperationException or ArgumentException or System.ComponentModel.Win32Exception)
+        {
+            Log.Warn(ex, "adopted ROCm server configuration could not be verified");
+        }
+        _adoptedRuntimeError = "The running ROCm server's GPU visibility could not be verified. " +
+            "Exit Llama from the tray and launch it again to apply compatible GPU isolation. " +
+            "If this server was started outside Llama, stop it yourself first.";
+        Log.Warn(_adoptedRuntimeError);
+        UpdateModelProfileWarning();
+    }
+
+    private void WriteRocmServerState(Process process)
+    {
+        if (_rocmIsolation is null) return;
+        try
+        {
+            var state = new RocmServerState(process.Id, process.StartTime.ToUniversalTime().Ticks,
+                BinaryPath!, File.GetLastWriteTimeUtc(BinaryPath!).Ticks, _rocmIsolation, ActiveDeviceId,
+                _lastDeviceProbe.Devices.ToDictionary(d => d.Id, d => d.Name), RuntimeBackend, GpuDeviceName);
+            File.WriteAllText(RocmStatePath, JsonSerializer.Serialize(state));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or
+                                   System.ComponentModel.Win32Exception)
+        {
+            Log.Warn(ex, "ROCm server configuration could not be saved for adoption");
+        }
     }
 
     /// <summary>
@@ -941,9 +999,9 @@ public sealed class LlamaManager
         if (await ProbeHealthAsync(cancel))
         {
             Log.Info("adopted an already-running llama server (pre-start re-probe)");
+            await InitializeAdoptedRuntimeAsync(cancel);
             FailureMessage = null;
             ServerStatus = ServerState.Running;
-            _ = ResolveAndReadVersionAsync(cancel);
             return true;
         }
 
@@ -959,9 +1017,9 @@ public sealed class LlamaManager
             if (await WaitForReachableAsync(TimeSpan.FromSeconds(15), cancel))
             {
                 Log.Info($"adopted the managed llama server (pid {managedPid})");
+                await InitializeAdoptedRuntimeAsync(cancel);
                 FailureMessage = null;
                 ServerStatus = ServerState.Running;
-                _ = ResolveAndReadVersionAsync(cancel);
                 return true;
             }
             Log.Warn($"managed llama server (pid {managedPid}) never became reachable; killing and relaunching");
@@ -1036,18 +1094,35 @@ public sealed class LlamaManager
         try
         {
             await _additionalModels.RefreshAsync(AdditionalModelDirectories, cancel, force: true);
-            var needsDeviceProbe = InferenceRuntime.Normalize(RuntimeBackend) != InferenceRuntime.Automatic
-                || !string.IsNullOrWhiteSpace(GpuDeviceName)
-                || ModelPromptProfiles?.Values.Any(profile => profile is not null &&
-                    !string.IsNullOrEmpty(profile.GpuDeviceName) && profile.GpuDeviceName != "none") == true;
-            var probe = needsDeviceProbe
-                ? await ProbeDevicesAsync(cancel)
-                : new DeviceProbe(false, []);
+            // Automatic installations can also contain a single-architecture
+            // ROCm build, so even Automatic must check compatibility.
+            var probe = await ProbeDevicesAsync(cancel, force: true);
             var selection = InferenceRuntime.SelectDevice(RuntimeBackend, GpuDeviceName, probe);
             _lastDeviceProbe = probe;
+            if (selection.Error is not null)
+            {
+                FailureMessage = selection.Error;
+                Log.Error(FailureMessage);
+                ServerStatus = ServerState.Failed;
+                return false;
+            }
+            _adoptedRuntimeError = null;
+            _rocmIsolation = RocmDeviceIsolation.Create(probe, RocmDeviceIsolation.InheritedVisibility);
+            if (_rocmIsolation is not null && customArguments.Any(arg =>
+                new[] { "--device", "-dev", "--main-gpu", "-mg" }.Any(flag =>
+                    arg.Equals(flag, StringComparison.OrdinalIgnoreCase) ||
+                    arg.StartsWith(flag + "=", StringComparison.OrdinalIgnoreCase))))
+            {
+                FailureMessage = "Use the GPU picker instead of custom device/main-GPU arguments with ROCm; " +
+                    "Llama remaps device indices after isolating compatible GPUs.";
+                Log.Error(FailureMessage);
+                ServerStatus = ServerState.Failed;
+                return false;
+            }
             ActiveDeviceId = selection.DeviceArgument;
             RuntimeFallbackReason = selection.FallbackReason;
             if (RuntimeFallbackReason is not null) Log.Warn(RuntimeFallbackReason);
+            UpdateModelProfileWarning();
 
             var psi = new ProcessStartInfo
             {
@@ -1061,6 +1136,10 @@ public sealed class LlamaManager
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
             };
+            _rocmIsolation?.Apply(psi);
+            if (_rocmIsolation is not null)
+                Log.Info("server process HIP_VISIBLE_DEVICES=" + _rocmIsolation.VisibleDevices +
+                    "; ROCm mapping: " + string.Join(", ", _rocmIsolation.DeviceIds.Select(p => $"{p.Key}->{p.Value}")));
             // Per-model context lengths are merged into each model's child args
             // via --models-preset (see BuildServeArguments). Written fresh every
             // launch from the current preferences.
@@ -1132,6 +1211,7 @@ public sealed class LlamaManager
             // Track ownership across app restarts: if the app crashes, the next
             // instance recognizes this server as managed via the PID file.
             WritePidFile(proc.Id);
+            WriteRocmServerState(proc);
 
             // The server's stdout/stderr are redirected; drain them or a chatty
             // server blocks once the pipe buffer fills. Draining also captures
@@ -1216,6 +1296,8 @@ public sealed class LlamaManager
     public void StopServer()
     {
         ServerStatus = ServerState.Stopped;
+        _rocmIsolation = null;
+        _adoptedRuntimeError = null;
 
         var proc = _serverProcess;
         _serverProcess = null;
@@ -1290,21 +1372,40 @@ public sealed class LlamaManager
             .Where(device => device.Kind is not (DeviceKind.Cpu or DeviceKind.Unknown))
             .ToArray();
         var deviceIds = devices.ToDictionary(
-            device => GpuDeviceChoice.Key(device, devices), device => device.Id,
+            device => GpuDeviceChoice.Key(device, devices),
+            device =>
+            {
+                var selection = InferenceRuntime.SelectDevice(RuntimeBackend,
+                    GpuDeviceChoice.Key(device, devices), probe ?? _lastDeviceProbe);
+                return _rocmIsolation?.MapArgument(selection.DeviceArgument) ?? selection.DeviceArgument ?? "none";
+            },
             StringComparer.OrdinalIgnoreCase);
         var profiles = InferenceTuning.CompatibleModelProfiles(ModelPromptProfiles,
             BatchSize, MicroBatchSize, _serveCapabilities, out _);
         return ModelPresets.Render(ModelContextLengths, profiles,
-            BuildGlobalInferenceProfile(), deviceIds, globalDeviceId, _additionalModels.Snapshot);
+            BuildGlobalInferenceProfile(), deviceIds,
+            _rocmIsolation?.MapArgument(globalDeviceId) ?? globalDeviceId, _additionalModels.Snapshot);
     }
 
     private void UpdateModelProfileWarning()
     {
         InferenceTuning.CompatibleModelProfiles(ModelPromptProfiles,
             BatchSize, MicroBatchSize, _serveCapabilities, out var warnings);
-        var warning = warnings.Count == 0 ? null :
-            "Some saved model overrides were not applied. Open the model's details to edit or Reset them.\n" +
-            string.Join('\n', warnings);
+        var allWarnings = warnings.ToList();
+        if (_adoptedRuntimeError is not null) allWarnings.Add(_adoptedRuntimeError);
+        var profiles = InferenceTuning.CompatibleModelProfiles(ModelPromptProfiles,
+            BatchSize, MicroBatchSize, _serveCapabilities, out _);
+        foreach (var (id, profile) in profiles ??
+                 Enumerable.Empty<KeyValuePair<string, ModelPromptProcessingProfile>>())
+        {
+            if (profile is not null && !string.IsNullOrEmpty(profile.GpuDeviceName) &&
+                profile.GpuDeviceName != "none" &&
+                InferenceRuntime.SelectDevice(RuntimeBackend, profile.GpuDeviceName, _lastDeviceProbe).Error is { } error)
+                allWarnings.Add($"{id}: {error}");
+        }
+        var warning = allWarnings.Count == 0 ? null :
+            "Some model GPU settings or saved overrides need attention. Open Settings or the model's details to edit or Reset them.\n" +
+            string.Join('\n', allWarnings);
         if (warning is not null && warning != ModelProfileWarning) Log.Warn(warning);
         ModelProfileWarning = warning;
     }
@@ -1324,6 +1425,9 @@ public sealed class LlamaManager
             string.Join(' ', args.Select(Quote)) +
             "\n\nModel presets (applied when each model loads):\n" +
             (preset ?? "(none; llama.cpp defaults)") +
+            (_rocmIsolation is null ? "" : "\n\nProcess-only HIP_VISIBLE_DEVICES=" +
+                _rocmIsolation.VisibleDevices + "\nROCm device mapping: " +
+                string.Join(", ", _rocmIsolation.DeviceIds.Select(pair => $"{pair.Key} -> {pair.Value}"))) +
             (ModelProfileWarning is null ? "" : "\n\n" + ModelProfileWarning);
     }
 
@@ -1366,10 +1470,18 @@ public sealed class LlamaManager
             if (!_serveCapabilities.Succeeded && BinaryPath is not null &&
                 ModelPromptProfiles?.Values.Any(profile => profile is not null && !profile.IsAutomatic) == true)
                 _serveCapabilities = await ServeCapabilities.ProbeAsync(BinaryPath, cancel);
-            UpdateModelProfileWarning();
-            if (ModelPromptProfiles?.Values.Any(profile => profile is not null &&
+            if (_rocmIsolation is not null || ModelPromptProfiles?.Values.Any(profile => profile is not null &&
                 !string.IsNullOrEmpty(profile.GpuDeviceName) && profile.GpuDeviceName != "none") == true)
-                _lastDeviceProbe = await ProbeDevicesAsync(cancel);
+            {
+                var probe = await ProbeDevicesAsync(cancel);
+                if (ValidateRunningRocmProbe(probe)) _lastDeviceProbe = probe;
+            }
+            UpdateModelProfileWarning();
+            if (_adoptedRuntimeError is not null)
+            {
+                Log.Warn("model preset reload skipped: " + _adoptedRuntimeError);
+                return;
+            }
             WriteModelPresetsIni(ActiveDeviceId, _lastDeviceProbe);
             if (ServerStatus != ServerState.Running) return;
             using var budget = WithTimeout(TimeSpan.FromSeconds(10), cancel);
@@ -1680,7 +1792,8 @@ public sealed class LlamaManager
     // ---- Device probing / model fit ----
 
     /// <summary>Cached device probe result + timestamp (see <see cref="ProbeDevicesAsync"/>).</summary>
-    private (DateTime At, DeviceProbe? Probe) _devicesCache;
+    private readonly SemaphoreSlim _deviceProbeGate = new(1, 1);
+    private (DateTime At, string? Binary, long ModifiedTicks, string? Visibility, DeviceProbe? Probe) _devicesCache;
 
     /// <summary>
     /// Probes the compute devices available to llama.cpp by running
@@ -1702,6 +1815,29 @@ public sealed class LlamaManager
         return probe.Devices.Where(device => selected.Contains(device.Id, StringComparer.OrdinalIgnoreCase)).ToArray();
     }
 
+    /// <summary>A specific runtime/device error to display before loading a model.</summary>
+    public string? GetModelLoadCompatibilityError(string modelId)
+    {
+        if (_adoptedRuntimeError is not null) return _adoptedRuntimeError;
+        var profiles = InferenceTuning.CompatibleModelProfiles(ModelPromptProfiles,
+            BatchSize, MicroBatchSize, _serveCapabilities, out _);
+        var gpu = profiles is not null && profiles.TryGetValue(modelId, out var profile) &&
+            profile is not null && !string.IsNullOrEmpty(profile.GpuDeviceName)
+                ? profile.GpuDeviceName : GpuDeviceName;
+        return gpu == "none" ? null :
+            InferenceRuntime.SelectDevice(RuntimeBackend, gpu, _lastDeviceProbe).Error;
+    }
+
+    private bool ValidateRunningRocmProbe(DeviceProbe probe)
+    {
+        if (_rocmIsolation is null) return true;
+        if (RocmDeviceIsolation.SameDevices(_lastDeviceProbe, probe)) return true;
+        _adoptedRuntimeError = "ROCm GPUs or their enumeration order changed. Exit Llama from the tray and launch it again before loading models.";
+        Log.Warn(_adoptedRuntimeError);
+        UpdateModelProfileWarning();
+        return false;
+    }
+
     /// <summary>
     /// The full probe result, including whether the probe succeeded — see
     /// <see cref="DeviceProbe"/>. Callers that only budget memory can use
@@ -1709,32 +1845,39 @@ public sealed class LlamaManager
     /// indicator needs the success flag to tell "CPU-only machine" apart
     /// from "probe failed / binary not resolved yet".
     /// </summary>
-    public async Task<DeviceProbe> ProbeDevicesAsync(CancellationToken cancel = default)
+    public async Task<DeviceProbe> ProbeDevicesAsync(CancellationToken cancel = default, bool force = false)
     {
         const double CacheTtlSeconds = 60;
-
-        var cache = _devicesCache;
-        if (cache.Probe is not null &&
-            (DateTime.UtcNow - cache.At).TotalSeconds < CacheTtlSeconds)
-            return cache.Probe;
-
-        var binary = BinaryPath;
-        if (binary is null || !File.Exists(binary))
-            binary = FindOnPath("llama.exe");
-        if (binary is null)
+        await _deviceProbeGate.WaitAsync(cancel);
+        try
         {
-            Log.Debug("list-devices skipped: no llama binary resolved yet");
-            return new DeviceProbe(false, []);
-        }
+            var binary = BinaryPath;
+            if (binary is null || !File.Exists(binary))
+                binary = FindOnPath("llama.exe");
+            if (binary is null)
+            {
+                Log.Debug("list-devices skipped: no llama binary resolved yet");
+                return new DeviceProbe(false, []);
+            }
 
-        var probe = await DeviceQuery.ListDevicesAsync(binary, cancel);
-        _devicesCache = (DateTime.UtcNow, probe);
-        Log.Info(probe.Devices.Count == 0
-            ? probe.Succeeded
-                ? "list-devices: no accelerator devices (CPU/RAM fallback)"
-                : "list-devices: probe failed (unreadable output)"
-            : $"list-devices: {string.Join(", ", probe.Devices.Select(d => $"{d.Id} '{d.Name}' {d.FreeBytes / (1 << 20)} MiB free"))}");
-        return probe;
+            var modified = File.GetLastWriteTimeUtc(binary).Ticks;
+            var visibility = RocmDeviceIsolation.InheritedVisibility;
+            var cache = _devicesCache;
+            if (!force && cache.Probe is not null && cache.Binary == binary &&
+                cache.ModifiedTicks == modified && cache.Visibility == visibility &&
+                (DateTime.UtcNow - cache.At).TotalSeconds < CacheTtlSeconds)
+                return cache.Probe;
+
+            var probe = await DeviceQuery.ListDevicesAsync(binary, cancel);
+            _devicesCache = (DateTime.UtcNow, binary, modified, visibility, probe);
+            Log.Info(probe.Devices.Count == 0
+                ? probe.Succeeded
+                    ? "list-devices: no accelerator devices (CPU/RAM fallback)"
+                    : "list-devices: probe failed (unreadable output)"
+                : $"list-devices: {string.Join(", ", probe.Devices.Select(d => $"{d.Id} '{d.Name}' {d.FreeBytes / (1 << 20)} MiB free"))}");
+            return probe;
+        }
+        finally { _deviceProbeGate.Release(); }
     }
 
     /// <summary>
@@ -1767,7 +1910,7 @@ public sealed class LlamaManager
     /// Cached fit-params probe results + timestamps, keyed by (model path,
     /// context tokens) — see <see cref="QueryFitParamsAsync"/>.
     /// </summary>
-    private readonly Dictionary<(string Path, int Ctx, string CacheK, string CacheV),
+    private readonly Dictionary<(string Path, int Ctx, string CacheK, string CacheV, string? Visibility, string? Device),
         (DateTime At, FitParamsEstimate? Estimate)> _fitParamsCache = new();
 
     /// <summary>
@@ -1788,7 +1931,16 @@ public sealed class LlamaManager
     {
         const double CacheTtlSeconds = 60;
 
-        var key = (modelPath, contextTokens, cacheTypeK, cacheTypeV);
+        var probe = await ProbeDevicesAsync(cancel);
+        var selection = InferenceRuntime.SelectDevice(RuntimeBackend, GpuDeviceName, probe);
+        if (selection.Error is not null)
+        {
+            Log.Warn("fit-params skipped: " + selection.Error);
+            return null;
+        }
+        var isolation = RocmDeviceIsolation.Create(probe, RocmDeviceIsolation.InheritedVisibility);
+        var device = isolation?.MapArgument(selection.DeviceArgument) ?? selection.DeviceArgument;
+        var key = (modelPath, contextTokens, cacheTypeK, cacheTypeV, isolation?.VisibleDevices, device);
         lock (_fitParamsCache)
         {
             if (_fitParamsCache.TryGetValue(key, out var cached) &&
@@ -1806,7 +1958,15 @@ public sealed class LlamaManager
         }
 
         var estimate = await FitParamsQuery.QueryAsync(binary, modelPath, contextTokens,
-            cancel, cacheTypeK, cacheTypeV);
+            cancel, cacheTypeK, cacheTypeV, isolation?.VisibleDevices, device);
+        if (estimate is not null && isolation is not null)
+            estimate = estimate with
+            {
+                Devices = estimate.Devices.Select(d => d with
+                {
+                    Name = isolation.DeviceIds.FirstOrDefault(pair => pair.Value == d.Name).Key ?? d.Name,
+                }).ToArray(),
+            };
         lock (_fitParamsCache)
         {
             _fitParamsCache[key] = (DateTime.UtcNow, estimate);
@@ -2153,6 +2313,12 @@ public sealed class LlamaManager
             return false;
 
         var modelId = model.ServerModelId;
+        if (_rocmIsolation is not null) ValidateRunningRocmProbe(await ProbeDevicesAsync(cancel));
+        if (GetModelLoadCompatibilityError(modelId) is { } compatibilityError)
+        {
+            Log.Warn($"model load rejected: {compatibilityError}");
+            return false;
+        }
 
         // Open the SSE stream before the POST when progress is wanted. If it
         // can't be opened (older server without /models/sse), degrade to

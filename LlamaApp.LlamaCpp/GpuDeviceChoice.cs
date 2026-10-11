@@ -37,5 +37,7 @@ public static class GpuDeviceChoice
     /// <summary>Snapshot of reported free and total memory for the picker.</summary>
     public static string Label(LlamaDevice device) =>
         $"{device.Name} ({device.Id}) · {MemoryFit.FormatBytes(device.FreeBytes)} free / " +
-        $"{MemoryFit.FormatBytes(device.TotalBytes)} total";
+        $"{MemoryFit.FormatBytes(device.TotalBytes)} total" +
+        (device.Architecture is null ? "" : $" · {device.Architecture}") +
+        (device.CompatibilityError is null ? "" : " · incompatible/unverified runtime");
 }

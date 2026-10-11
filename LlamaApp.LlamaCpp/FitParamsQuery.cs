@@ -95,7 +95,8 @@ public static partial class FitParamsQuery
     /// </summary>
     public static async Task<FitParamsEstimate?> QueryAsync(
         string binaryPath, string modelPath, int contextTokens, CancellationToken cancel = default,
-        string cacheTypeK = "f16", string cacheTypeV = "f16")
+        string cacheTypeK = "f16", string cacheTypeV = "f16",
+        string? hipVisibleDevices = null, string? deviceArgument = null)
     {
         var tail = new List<string>
         {
@@ -103,6 +104,16 @@ public static partial class FitParamsQuery
             "-c", contextTokens.ToString(CultureInfo.InvariantCulture),
             "--fit-print", "on",
         };
+        if (deviceArgument is not null)
+        {
+            tail.Add("--device");
+            tail.Add(deviceArgument);
+            if (deviceArgument == "none")
+            {
+                tail.Add("--n-gpu-layers");
+                tail.Add("0");
+            }
+        }
         if (cacheTypeK != "f16" &&
             LlamaManager.SupportedKvCacheTypes.Contains(cacheTypeK, StringComparer.Ordinal))
         {
@@ -122,7 +133,7 @@ public static partial class FitParamsQuery
             string? output;
             try
             {
-                output = await RunAsync(binaryPath, args, cancel);
+                output = await RunAsync(binaryPath, args, cancel, hipVisibleDevices);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -158,7 +169,8 @@ public static partial class FitParamsQuery
     /// build). Bounded by a 30s timeout — a big model's metadata read can
     /// take a while, but a hung probe is killed and reported as <c>null</c>.
     /// </summary>
-    private static async Task<string?> RunAsync(string binaryPath, string[] args, CancellationToken cancel)
+    private static async Task<string?> RunAsync(
+        string binaryPath, string[] args, CancellationToken cancel, string? hipVisibleDevices)
     {
         var psi = new ProcessStartInfo
         {
@@ -168,6 +180,7 @@ public static partial class FitParamsQuery
             RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
+        if (hipVisibleDevices is not null) psi.Environment["HIP_VISIBLE_DEVICES"] = hipVisibleDevices;
         foreach (var arg in args)
             psi.ArgumentList.Add(arg);
 
@@ -186,9 +199,12 @@ public static partial class FitParamsQuery
         {
             await proc.WaitForExitAsync(timeout.Token);
         }
-        catch (OperationCanceledException) when (!cancel.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
-            try { proc.Kill(entireProcessTree: true); } catch { /* best-effort */ }
+            try { proc.Kill(entireProcessTree: true); }
+            catch (InvalidOperationException) { }
+            catch (System.ComponentModel.Win32Exception ex) { Log.Warn(ex, "fit-params probe cleanup failed"); }
+            cancel.ThrowIfCancellationRequested();
             return null;
         }
 

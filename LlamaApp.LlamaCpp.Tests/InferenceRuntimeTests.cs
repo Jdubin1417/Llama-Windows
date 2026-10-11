@@ -72,6 +72,14 @@ public sealed class InferenceRuntimeTests
     public void AutomaticSelectionPreservesLlamaDefaults()
         => Assert.Null(InferenceRuntime.SelectDevice("auto", "", TwoRadeons).DeviceArgument);
 
+    [Fact]
+    public void FailedAutomaticProbeDoesNotLeaveUnverifiedGpusEnabled()
+    {
+        var selection = InferenceRuntime.SelectDevice("auto", "", new DeviceProbe(false, []));
+        Assert.Equal("none", selection.DeviceArgument);
+        Assert.NotNull(selection.FallbackReason);
+    }
+
     [Theory]
     [InlineData("AMD Radeon(TM) 8060S Graphics", "Vulkan0")]
     [InlineData("AMD Radeon RX 9060 XT", "Vulkan1")]

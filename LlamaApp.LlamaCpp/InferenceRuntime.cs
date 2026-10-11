@@ -57,10 +57,11 @@ public static class InferenceRuntime
         var requested = Normalize(backend);
         if (requested == Cpu)
             return new DeviceSelection("none", null);
-        if (requested == Automatic && string.IsNullOrWhiteSpace(gpuName))
-            return new DeviceSelection(null, null); // Keep llama.cpp's defaults.
         if (!probe.Succeeded)
             return new DeviceSelection("none", "GPU detection failed; using the CPU.");
+        if (requested == Automatic && string.IsNullOrWhiteSpace(gpuName) &&
+            !probe.Devices.Any(d => d.Kind == DeviceKind.Rocm))
+            return new DeviceSelection(null, null); // Keep llama.cpp's defaults.
 
         var candidates = probe.Devices.Where(device => requested switch
         {
@@ -75,12 +76,17 @@ public static class InferenceRuntime
             var match = GpuDeviceChoice.Resolve(gpuName, candidates);
             return match is null
                 ? new DeviceSelection("none", $"{gpuName} is unavailable; using the CPU.")
-                : new DeviceSelection(match.Id, null);
+                : match.CompatibilityError is { } error
+                    ? new DeviceSelection("none", null) { Error = error }
+                    : new DeviceSelection(match.Id, null);
         }
 
+        var compatible = candidates.Where(d => d.CompatibilityError is null).ToArray();
+        if (candidates.Length > 0 && compatible.Length == 0)
+            return new DeviceSelection("none", null) { Error = candidates[0].CompatibilityError };
         return candidates.Length == 0
             ? new DeviceSelection("none", $"No {requested.ToUpperInvariant()} GPU is available; using the CPU.")
-            : new DeviceSelection(string.Join(',', candidates.Select(device => device.Id)), null);
+            : new DeviceSelection(string.Join(',', compatible.Select(device => device.Id)), null);
     }
 
     /// <summary>Validated --n-gpu-layers value; null means llama.cpp's automatic default.</summary>
@@ -94,4 +100,7 @@ public static class InferenceRuntime
 }
 
 /// <summary>Resolved CLI device and any reason for a CPU fallback.</summary>
-public sealed record DeviceSelection(string? DeviceArgument, string? FallbackReason);
+public sealed record DeviceSelection(string? DeviceArgument, string? FallbackReason)
+{
+    public string? Error { get; init; }
+}

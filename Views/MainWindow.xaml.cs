@@ -2023,8 +2023,17 @@ namespace LlamaApp.Views
                     // and the play glyph returned with no explanation (OOM,
                     // corrupt GGUF, server refusal all looked identical).
                     item.LoadFailed = true;
-                    NotifyWhenHidden("Couldn't load model",
+                    var compatibilityError = mgr.GetModelLoadCompatibilityError(((IModel)item).ServerModelId);
+                    NotifyWhenHidden("Couldn't load model", compatibilityError ??
                         $"{item.DisplayName} couldn't be loaded. It may not fit in memory, or the file may be corrupt.");
+                    if (compatibilityError is not null && IsFlyoutVisible)
+                        new Flyout
+                        {
+                            Content = new TextBlock
+                            {
+                                Text = compatibilityError, TextWrapping = TextWrapping.Wrap, MaxWidth = 320,
+                            },
+                        }.ShowAt(_detailsViewModel is null ? ModelsList : DetailsView);
                 }
                 if (queue is null || queue.HasThreadAccess)
                     Rejected();
